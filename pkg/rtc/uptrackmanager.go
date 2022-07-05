@@ -8,6 +8,7 @@ import (
 	"github.com/livekit/protocol/logger"
 
 	"github.com/livekit/livekit-server/pkg/rtc/types"
+	"github.com/livekit/livekit-server/pkg/utils"
 )
 
 var (
@@ -32,6 +33,8 @@ type UpTrackManager struct {
 	// keeps tracks of track specific subscribers who are awaiting permission
 	pendingSubscriptions map[livekit.TrackID][]livekit.ParticipantIdentity // trackID => []subscriberIdentity
 
+	opsQueue *utils.OpsQueue
+
 	lock sync.RWMutex
 
 	// callbacks & handlers
@@ -44,10 +47,12 @@ func NewUpTrackManager(params UpTrackManagerParams) *UpTrackManager {
 		params:               params,
 		publishedTracks:      make(map[livekit.TrackID]types.MediaTrack),
 		pendingSubscriptions: make(map[livekit.TrackID][]livekit.ParticipantIdentity),
+		opsQueue:             utils.NewOpsQueue(params.Logger, "utm", 20),
 	}
 }
 
 func (u *UpTrackManager) Start() {
+	u.opsQueue.Start()
 }
 
 func (u *UpTrackManager) Restart() {
@@ -57,6 +62,8 @@ func (u *UpTrackManager) Restart() {
 }
 
 func (u *UpTrackManager) Close(willBeResumed bool) {
+	u.opsQueue.Stop()
+
 	u.lock.Lock()
 	u.closed = true
 	notify := len(u.publishedTracks) == 0
@@ -117,7 +124,7 @@ func (u *UpTrackManager) AddSubscriber(sub types.LocalParticipant, params types.
 	for _, track := range tracks {
 		trackIDs = append(trackIDs, track.ID())
 	}
-	u.params.Logger.Debugw("subscribing new participant to tracks",
+	u.params.Logger.Debugw("subscribing participant to tracks",
 		"subscriber", sub.Identity(),
 		"subscriberID", sub.ID(),
 		"trackIDs", trackIDs)
@@ -137,6 +144,10 @@ func (u *UpTrackManager) AddSubscriber(sub types.LocalParticipant, params types.
 			return n, err
 		}
 		n += 1
+
+		u.lock.Lock()
+		u.maybeRemovePendingSubscription(trackID, sub, true)
+		u.lock.Unlock()
 	}
 	return n, nil
 }
@@ -148,7 +159,7 @@ func (u *UpTrackManager) RemoveSubscriber(sub types.LocalParticipant, trackID li
 	}
 
 	u.lock.Lock()
-	u.maybeRemovePendingSubscription(trackID, sub)
+	u.maybeRemovePendingSubscription(trackID, sub, false)
 	u.lock.Unlock()
 }
 
@@ -198,6 +209,7 @@ func (u *UpTrackManager) UpdateSubscriptionPermission(
 	u.lock.Lock()
 	defer u.lock.Unlock()
 
+	u.params.Logger.Debugw("updating subscription permission", "permissions", subscriptionPermission)
 	if subscriptionPermission == nil {
 		// store as is for use when migrating
 		u.subscriptionPermission = subscriptionPermission
@@ -415,16 +427,22 @@ func (u *UpTrackManager) maybeAddPendingSubscription(trackID livekit.TrackID, su
 	}
 
 	u.pendingSubscriptions[trackID] = append(u.pendingSubscriptions[trackID], subscriberIdentity)
-	go sub.SubscriptionPermissionUpdate(u.params.SID, trackID, false)
+	u.params.Logger.Debugw("adding pending subscription", "subscriberID", sub.ID(), "trackID", trackID)
+	u.opsQueue.Enqueue(func() {
+		sub.SubscriptionPermissionUpdate(u.params.SID, trackID, false)
+	})
 }
 
-func (u *UpTrackManager) maybeRemovePendingSubscription(trackID livekit.TrackID, sub types.LocalParticipant) {
+func (u *UpTrackManager) maybeRemovePendingSubscription(trackID livekit.TrackID, sub types.LocalParticipant, sendUpdate bool) {
 	subscriberIdentity := sub.Identity()
+
+	found := false
 
 	pending := u.pendingSubscriptions[trackID]
 	n := len(pending)
 	for idx, identity := range pending {
 		if identity == subscriberIdentity {
+			found = true
 			u.pendingSubscriptions[trackID][idx] = u.pendingSubscriptions[trackID][n-1]
 			u.pendingSubscriptions[trackID] = u.pendingSubscriptions[trackID][:n-1]
 			break
@@ -432,6 +450,13 @@ func (u *UpTrackManager) maybeRemovePendingSubscription(trackID livekit.TrackID,
 	}
 	if len(u.pendingSubscriptions[trackID]) == 0 {
 		delete(u.pendingSubscriptions, trackID)
+	}
+
+	if found && sendUpdate {
+		u.params.Logger.Debugw("removing pending subscription", "subscriberID", sub.ID(), "trackID", trackID)
+		u.opsQueue.Enqueue(func() {
+			sub.SubscriptionPermissionUpdate(u.params.SID, trackID, true)
+		})
 	}
 }
 
@@ -462,13 +487,16 @@ func (u *UpTrackManager) processPendingSubscriptions(resolver func(participantId
 			}
 
 			if err := track.AddSubscriber(sub); err != nil {
-				u.params.Logger.Errorw("error reinstating pending subscription", err)
+				u.params.Logger.Errorw("error reinstating subscription", err, "subscirberID", sub.ID(), "trackID", trackID)
 				// keep it in pending on error in case the error is transient
 				updatedPending = append(updatedPending, identity)
 				continue
 			}
 
-			go sub.SubscriptionPermissionUpdate(u.params.SID, trackID, true)
+			u.params.Logger.Debugw("reinstating subscription", "subscriberID", sub.ID(), "trackID", trackID)
+			u.opsQueue.Enqueue(func() {
+				sub.SubscriptionPermissionUpdate(u.params.SID, trackID, true)
+			})
 		}
 
 		updatedPendingSubscriptions[trackID] = updatedPending

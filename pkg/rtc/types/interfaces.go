@@ -80,6 +80,7 @@ const (
 	ParticipantCloseReasonSimulateMigration
 	ParticipantCloseReasonSimulateNodeFailure
 	ParticipantCloseReasonSimulateServerLeave
+	ParticipantCloseReasonNegotiateFailed
 )
 
 func (p ParticipantCloseReason) String() string {
@@ -118,8 +119,41 @@ func (p ParticipantCloseReason) String() string {
 		return "SIMULATE_NODE_FAILURE"
 	case ParticipantCloseReasonSimulateServerLeave:
 		return "SIMULATE_SERVER_LEAVE"
+	case ParticipantCloseReasonNegotiateFailed:
+		return "NEGOTIATE_FAILED"
 	default:
 		return fmt.Sprintf("%d", int(p))
+	}
+}
+
+func (p ParticipantCloseReason) ToDisconnectReason() livekit.DisconnectReason {
+	switch p {
+	case ParticipantCloseReasonClientRequestLeave:
+		return livekit.DisconnectReason_CLIENT_INITIATED
+	case ParticipantCloseReasonRoomManagerStop:
+		return livekit.DisconnectReason_SERVER_SHUTDOWN
+	case ParticipantCloseReasonVerifyFailed, ParticipantCloseReasonJoinFailed, ParticipantCloseReasonJoinTimeout:
+		// expected to be connected but is not
+		return livekit.DisconnectReason_JOIN_FAILURE
+	case ParticipantCloseReasonPeerConnectionDisconnected:
+		return livekit.DisconnectReason_STATE_MISMATCH
+	case ParticipantCloseReasonDuplicateIdentity, ParticipantCloseReasonMigrationComplete, ParticipantCloseReasonStale:
+		return livekit.DisconnectReason_DUPLICATE_IDENTITY
+	case ParticipantCloseReasonServiceRequestRemoveParticipant:
+		return livekit.DisconnectReason_PARTICIPANT_REMOVED
+	case ParticipantCloseReasonServiceRequestDeleteRoom:
+		return livekit.DisconnectReason_ROOM_DELETED
+	case ParticipantCloseReasonSimulateMigration:
+		return livekit.DisconnectReason_DUPLICATE_IDENTITY
+	case ParticipantCloseReasonSimulateNodeFailure:
+		return livekit.DisconnectReason_SERVER_SHUTDOWN
+	case ParticipantCloseReasonSimulateServerLeave:
+		return livekit.DisconnectReason_SERVER_SHUTDOWN
+	case ParticipantCloseReasonNegotiateFailed:
+		return livekit.DisconnectReason_STATE_MISMATCH
+	default:
+		// the other types will map to unknown reason
+		return livekit.DisconnectReason_UNKNOWN_REASON
 	}
 }
 
@@ -297,6 +331,7 @@ type MediaTrack interface {
 	RemoveAllSubscribers(willBeResumed bool)
 	RevokeDisallowedSubscribers(allowedSubscriberIdentities []livekit.ParticipantIdentity) []livekit.ParticipantIdentity
 	GetAllSubscribers() []livekit.ParticipantID
+	GetNumSubscribers() int
 
 	// returns quality information that's appropriate for width & height
 	GetQualityForDimension(width, height uint32) livekit.VideoQuality
